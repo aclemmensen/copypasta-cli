@@ -12,3 +12,8 @@ serde_json = "*"
 atty = "0.2"
 clap = "2.32"
 term_size = "0.3.1"
+phoenix = {git = "https://github.com/laibulle/phoenix-rs"}
+websocket = "0.20"
+tokio-core = "*"
+futures = "*"
+base64 = "*"
