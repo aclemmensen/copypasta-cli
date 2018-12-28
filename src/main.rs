@@ -1,27 +1,22 @@
-use phoenix::PhoenixEvent;
 use std::fmt::Display;
 use std::error::Error;
 use serde_derive::{Serialize, Deserialize};
 use reqwest::{StatusCode};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::Path;
-use std::collections::HashMap;
 use atty::Stream as AStream;
 use clap::{Arg, App, SubCommand, AppSettings};
 use term_size as ts;
 
-use phoenix::{Phoenix, Event};
-use websocket::futures::sync::mpsc::channel;
-use tokio_core::reactor::Core;
-use futures::stream::Stream;
+mod streams;
 
 const LOGIN_NAME: &str = "login";
 const LIST_NAME: &str = "list";
 const PRODUCE_NAME: &str = "produce";
 const CONSUME_NAME: &str = "consume";
 
-const DEFAULT_SCHEME: &str = "https";
-const DEFAULT_HOST: &str = "copypasta.gw.wepo.dk";
+const DEFAULT_SCHEME: &str = "http";
+const DEFAULT_HOST: &str = "localhost:4000";
 const DEFAULT_CONFIG: &str = ".pastaconfig";
 
 fn main() {
@@ -51,9 +46,9 @@ fn main() {
     match get_app_if_configured(&config_file) {
         Ok(app) => {
             if let Some(_) = matches.subcommand_matches(PRODUCE_NAME) {
-                produce();
+                streams::produce();
             } else if let Some(_) = matches.subcommand_matches(CONSUME_NAME) {
-                consume();
+                streams::consume();
             } else if let Some(_) = matches.subcommand_matches(LIST_NAME) {
                 handle_list(&app);
             } else if let Some(_) = matches.subcommand_matches(LOGIN_NAME) {
@@ -94,153 +89,18 @@ fn handle_default(app: &PastaClient) {
 
 fn handle_list(app: &PastaClient) {
     let lst = app.list().unwrap();
-    let w = ts::dimensions()
+    let width = ts::dimensions()
         .map(|(w, _)| w)
         .unwrap_or(80);
     
     for p in lst {
         let content = p.content.replace("\n", "\\n").replace("\t", " ").to_string();
-        let w = std::cmp::min(w, content.chars().count());
-        let w = w-6;
-        let w = std::cmp::max(w, 0);
-        let snippet = &content[0..w];
+        let width = std::cmp::min(width, content.chars().count());
+        let width = width-6;
+        let width = std::cmp::max(width, 0);
+        let snippet = &content[0..width];
         println!("{:05} {}", p.id, snippet);
     }
-}
-
-
-#[derive(Copy, Clone, Debug)]
-enum ProducerState  {
-    ReadyToProduce,
-    WaitingForAck,
-    Producing,
-    Done
-}
-
-#[derive(Copy, Clone)]
-enum ConsumerState {
-    ReadyToConsume,
-    Consuming,
-    Done
-}
-
-enum StreamEvent<'a> {
-    Custom(&'a str),
-    Defined(&'a PhoenixEvent)
-}
-
-fn into_good<'a>(evt: &'a Event) -> StreamEvent {
-    match evt {
-        Event::Custom(x) => StreamEvent::Custom(x.as_ref()),
-        Event::Defined(x) => StreamEvent::Defined(x)
-    }
-}
-
-fn send_msg(chan: &std::sync::Arc<std::sync::Mutex<phoenix::chan::Channel>>, msg_type: &str, payload: &str) {
-    let mut chan = chan.lock().unwrap();
-    let body = serde_json::from_str(payload).unwrap();
-    chan.send(Event::Custom(msg_type.to_string()), &body);
-}
-
-fn send_msg2(chan: &mut phoenix::chan::Channel, msg_type: &str, payload: &str) {
-    let body = serde_json::from_str(payload).unwrap();
-    chan.send(Event::Custom(msg_type.to_string()), &body);
-}
-
-fn produce() {
-    let (sender, emitter) = channel(0);
-    let (callback, messages) = channel(0);
-
-    let mut p = HashMap::new();
-    p.insert("token", "xxx");
-
-    let mut phx = Phoenix::new_with_parameters(&sender, emitter, &callback, "ws://localhost:4000/socket", &p);
-    let chan = phx.channel("streams:x").clone();
-    {
-        let mut chan = chan.lock().unwrap();
-        chan.join();
-    }
-
-    send_msg(&chan, "producer_join", "{}");
-    let output_buffer = String::new();
-    let input_buffer = vec![0; 1_000_000];
-    let mut chan = chan.lock().unwrap();
-
-    let runner = messages.fold((ProducerState::ReadyToProduce, input_buffer, output_buffer), |(state, mut in_buf, mut out_buf), message| {
-        // eprintln!("SAD {:#?} {:?}", message, state); 
-        match (state, into_good(&message.event)) {
-            (ProducerState::ReadyToProduce, StreamEvent::Custom("bytes_requested")) => {
-                match io::stdin().read(&mut in_buf) {
-                    Ok(0) => {
-                        send_msg2(&mut chan, "done", "{}");
-                        Err(())
-                    },
-                    Ok(n) => {
-                        out_buf.clear();
-                        out_buf.push('"');
-                        base64::encode_config_buf(&in_buf[0..n], base64::STANDARD, &mut out_buf);
-                        out_buf.push('"');
-                        send_msg2(&mut chan, "bytes", &out_buf);
-                        Ok((ProducerState::ReadyToProduce, in_buf, out_buf))
-                    },
-                    Err(_) => {
-                        send_msg2(&mut chan, "done", "{\"error\": true}");
-                        Err(())
-                    }
-                }
-            },
-            _ => Ok((state, in_buf, out_buf))
-        }
-    });
-
-    let mut core = Core::new().unwrap();
-    core.run(runner).map(|_| ()).unwrap_or(());
-
-    eprintln!("Done producing");
-}
-
-fn consume() {
-    let (sender, emitter) = channel(0);
-    let (callback, messages) = channel(0);
-
-    let mut p = HashMap::new();
-    p.insert("token", "xxx");
-
-    let mut phx = Phoenix::new_with_parameters(&sender, emitter, &callback, "ws://localhost:4000/socket", &p);
-    let chan = phx.channel("streams:x").clone();
-    {
-        let mut chan = chan.lock().unwrap();
-        chan.join();
-    }
-
-    send_msg(&chan, "consumer_join", "{}");
-    send_msg(&chan, "request_bytes", "{}");
-
-    let mut chan = chan.lock().unwrap();
-
-    let runner = messages.fold(ConsumerState::Consuming, |state, message| {
-        // eprintln!("{:#?}", message);
-        match (state, into_good(&message.event)) {
-            (ConsumerState::Consuming, StreamEvent::Custom("bytes")) => {
-                // eprintln!("Got some bytes!");
-                let x = message.payload.get("data").unwrap().as_str().unwrap();
-                let decoded = base64::decode(x).unwrap();
-                io::stdout().write(&decoded).unwrap();
-                send_msg2(&mut chan, "request_bytes", "{}");
-                Ok(ConsumerState::Consuming)
-            },
-            (ConsumerState::Consuming, StreamEvent::Custom("no_more_data")) => {
-                eprintln!("Ate all the bytes");
-                Err(())
-            }
-            _ => Ok(state)
-        }
-    });
-
-    let mut core = Core::new().unwrap();
-    core.run(runner).map(|_| ()).unwrap_or(());
-
-    eprintln!("Done consuming");
 }
 
 fn read_all_input() -> Result<String, Box<Error>> {
@@ -293,9 +153,14 @@ fn verify_login(app: &mut PastaClient) -> Result<bool, HeyError> {
         Ok(_) => Ok(false),
         Err(HeyError::NotLoggedIn(login_url)) => {
             let token = prompt_token(login_url).unwrap();
+            let host = match app.config {
+                Some(ref c) => c.host.to_string(),
+                None => DEFAULT_HOST.to_string()
+            };
+
             app.set_config(ClientConfig {
                 token: token.trim().to_string(),
-                host: "".to_string()
+                host: host
             });
 
             match app.login() {
@@ -378,16 +243,6 @@ impl PastaClient {
             config: None,
             config_path: path
         }
-    }
-
-    fn from_config(path: &str) -> Result<PastaClient, HeyError> {
-        let config = ClientConfig::load_from_file(&path)?;
-
-        Ok(PastaClient {
-            config: Some(config),
-            client: reqwest::Client::new(),
-            config_path: path.to_string()
-        })
     }
 
     fn set_config(&mut self, config: ClientConfig) -> () {
