@@ -1,25 +1,27 @@
-use std::fmt::Display;
+#[macro_use] extern crate log;
+
 use std::error::Error;
-use serde_derive::{Serialize, Deserialize};
-use reqwest::{StatusCode};
 use std::io::{self, Read};
-use std::path::Path;
 use atty::Stream as AStream;
 use clap::{Arg, App, SubCommand, AppSettings};
 use term_size as ts;
 
 mod streams;
+mod client;
+
+use self::client::{PastaClient, HeyError, ClientConfig};
 
 const LOGIN_NAME: &str = "login";
 const LIST_NAME: &str = "list";
 const PRODUCE_NAME: &str = "produce";
 const CONSUME_NAME: &str = "consume";
 
-const DEFAULT_SCHEME: &str = "http";
 const DEFAULT_HOST: &str = "localhost:4000";
 const DEFAULT_CONFIG: &str = ".pastaconfig";
 
 fn main() {
+    env_logger::init();
+
     let matches = App::new("Copypasta")
         .version("1.0")
         .author("@aclemmensen")
@@ -46,13 +48,13 @@ fn main() {
     match get_app_if_configured(&config_file) {
         Ok(app) => {
             if let Some(_) = matches.subcommand_matches(PRODUCE_NAME) {
-                streams::produce();
+                streams::produce(app).unwrap();
             } else if let Some(_) = matches.subcommand_matches(CONSUME_NAME) {
-                streams::consume();
+                streams::consume(app, "x").unwrap();
             } else if let Some(_) = matches.subcommand_matches(LIST_NAME) {
                 handle_list(&app);
             } else if let Some(_) = matches.subcommand_matches(LOGIN_NAME) {
-                eprintln!("You are already logged");
+                eprintln!("You are already logged in");
             } else {
                 handle_default(&app);
             }
@@ -71,7 +73,9 @@ fn main() {
                 eprintln!("You are not logged in. Run `copypasta login` first.");
             }
         },
-        Err(e) => panic!(e)
+        Err(e) => {
+            eprintln!("Unhandled error: {:#?}", e);
+        }
     }
 }
 
@@ -112,9 +116,11 @@ fn read_all_input() -> Result<String, Box<Error>> {
 fn get_app(path: String) -> Result<PastaClient, HeyError> {
     match get_app_if_configured(&path) {
         Ok(app) => {
+            debug!("App already configured, returning");
             Ok(app)
         },
         Err(HeyError::NoConfigFound) => {
+            debug!("No configuration found, creating one");
             let client = reqwest::Client::new();
             let mut new_app = PastaClient::new(client, path);
 
@@ -142,33 +148,43 @@ fn build_and_verify(path: &str, config: ClientConfig) -> Result<PastaClient, Hey
 
     if verify_login(&mut app)? {
         app.save_config().unwrap();
-        return Ok(app)
     }
 
-    Err(HeyError::LoginError)
+    Ok(app)
 }
 
 fn verify_login(app: &mut PastaClient) -> Result<bool, HeyError> {
     match app.login() {
-        Ok(_) => Ok(false),
+        Ok(_) => {
+            debug!("Login successful, token not updated");
+            Ok(false)
+        },
         Err(HeyError::NotLoggedIn(login_url)) => {
+            debug!("User not logged in, prompting for token");
             let token = prompt_token(login_url).unwrap();
+            debug!("Received token \"{}\" from user", token);
             let host = match app.config {
                 Some(ref c) => c.host.to_string(),
                 None => DEFAULT_HOST.to_string()
             };
 
-            app.set_config(ClientConfig {
+            let config = ClientConfig {
                 token: token.trim().to_string(),
                 host: host
-            });
+            };
+
+            debug!("Storing user config: {:?}", config);
+
+            app.set_config(config);
 
             match app.login() {
                 Ok(user) => {
+                    debug!("Login test successful");
                     eprintln!("welcome, {}!", user.username);
                     Ok(true)
                 },
                 Err(e) =>  {
+                    warn!("Login failed");
                     eprintln!("An error occurred during login: {:?}", e);
                     Err(e)
                 }
@@ -185,175 +201,3 @@ fn prompt_token(login_url: String) -> Result<String, Box<Error>> {
     Ok(buffer)
 }
 
-struct PastaClient {
-    client: reqwest::Client,
-    config: Option<ClientConfig>,
-    config_path: String,
-}
-
-#[derive(Deserialize, Serialize)]
-struct ClientConfig {
-    token: String,
-    host: String
-}
-
-impl ClientConfig {
-    fn load_from_file(path: &str) -> Result<ClientConfig, HeyError> {
-        let fspath = Path::new(path);
-        if !fspath.is_file() {
-            return Err(HeyError::NoConfigFound);
-        }
-
-        let content = std::fs::read_to_string(path).unwrap();
-        let deser: ClientConfig = serde_json::from_str(&content).unwrap();
-        Ok(deser)
-    }
-}
-
-#[derive(Debug)]
-enum HeyError {
-    NoConfigFound,
-    NotLoggedIn(String),
-    LoginError,
-    NoToken,
-    ServerError(StatusCode),
-    RequestError(reqwest::Error)
-}
-
-impl From<reqwest::Error> for HeyError {
-    fn from(err: reqwest::Error) -> Self {
-        HeyError::RequestError(err)
-    }
-}
-
-impl Display for HeyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "HeyError")
-    }
-}
-
-impl Error for HeyError {
-
-}
-
-impl PastaClient {
-    fn new(client: reqwest::Client, path: String) -> PastaClient {
-        PastaClient {
-            client,
-            config: None,
-            config_path: path
-        }
-    }
-
-    fn set_config(&mut self, config: ClientConfig) -> () {
-        self.config = Some(config);
-    }
-    
-    fn login(&self) -> Result<UserInfo, HeyError> {
-        let mut resp = self.add_token(self.client.get(&self.get_url("api")))
-            .send()?;
-        
-        check_resp(&mut resp)?;
-
-        let resp: UserInfo = resp.json()?;
-
-        Ok(resp)
-    }
-
-    fn latest(&self) -> Result<Pasta, HeyError> {
-        let mut resp = self.add_token(self.client.get(&self.get_url("api/latest")))
-            .send()?;
-        
-        check_resp(&mut resp)?;
-
-        let pasta: Pasta = resp.json()?;
-
-        Ok(pasta)
-    }
-
-    fn list(&self) -> Result<Vec<Pasta>, HeyError> {
-        let mut resp = self.add_token(self.client.get(&self.get_url("api/list")))
-            .send()?;
-        
-        check_resp(&mut resp)?;
-
-        let pastas: Vec<Pasta> = resp.json()?;
-
-        Ok(pastas)
-    }
-
-    fn post(&self, content: String) -> Result<(), HeyError> {
-        let msg = CreatePasta {
-            content
-        };
-
-        let mut resp = self.add_token(self.client.post(&self.get_url("api/create")))
-            .json(&msg)
-            .send()?;
-        
-        check_resp(&mut resp)
-    }
-
-    fn save_config(&self) -> Result<(), Box<Error>> {
-        if let Some(conf) = &self.config {
-            let ser = serde_json::to_string(&conf)?;
-            std::fs::write(&self.config_path, &ser)?;
-            Ok(())
-        } else {
-            Err(Box::new(HeyError::NoToken))
-        }
-    }
-
-    fn add_token(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        if let Some(config) = &self.config {
-            return builder.bearer_auth(config.token.to_string());
-        }
-
-        return builder;
-    }
-
-    fn get_url(&self, url: &str) -> String {
-        match self.config {
-            Some(ref c) => format!("{}://{}/{}", DEFAULT_SCHEME, c.host, url),
-            None => format!("{}://{}/{}", DEFAULT_SCHEME, DEFAULT_HOST, url)
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct CreatePasta {
-    content: String
-}
-
-#[derive(Deserialize, Debug)]
-struct Pasta {
-    content: String,
-    copied_count: i32,
-    perma_id: String,
-    id: i64,
-    inserted_at: String
-}
-
-#[derive(Deserialize)]
-struct LoginResponse {
-    login_url: String
-}
-
-#[derive(Deserialize)]
-struct UserInfo {
-    //user_id: i64,
-    username: String
-}
-
-fn check_resp(resp: &mut reqwest::Response) -> Result<(), HeyError> {
-    match resp.status() {
-        StatusCode::OK =>
-            Ok(()),
-        StatusCode::FORBIDDEN => {
-            let r: LoginResponse = resp.json()?;
-            Err(HeyError::NotLoggedIn(r.login_url))
-        },
-        status =>
-            Err(HeyError::ServerError(status))
-    }
-}

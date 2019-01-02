@@ -5,6 +5,8 @@ use websocket::futures::sync::mpsc::channel;
 use tokio_core::reactor::Core;
 use futures::stream::Stream;
 
+use super::client::{PastaClient, HeyError};
+
 #[derive(Copy, Clone, Debug)]
 enum ProducerState  {
     ReadyToProduce,
@@ -43,20 +45,35 @@ fn send_msg2(chan: &mut phoenix::chan::Channel, msg_type: &str, payload: &str) {
     chan.send(Event::Custom(msg_type.to_string()), &body);
 }
 
-pub fn produce() {
+pub fn produce(client: PastaClient) -> Result<(), HeyError> {
     let (sender, emitter) = channel(0);
     let (callback, messages) = channel(0);
 
-    let mut p = HashMap::new();
-    p.insert("token", "xxx");
+    let url = client.get_socket_url()?;
+    debug!("Socket URL will be {}", url);
 
-    let mut phx = Phoenix::new_with_parameters(&sender, emitter, &callback, "ws://localhost:4000/socket", &p);
-    let chan = phx.channel("streams:x").clone();
+    let token = client.get_token().expect("no token provided");
+    debug!("Loaded user token {}", token);
+
+    let create_stream = client.create_stream()?;
+    debug!("Created stream id {}", create_stream.name);
+
+    let topic_name = format!("streams:{}", create_stream.name);
+    debug!("Will join channel {}", topic_name);
+
+    eprintln!("Created stream {}", create_stream.name);
+
+    let mut p = HashMap::new();
+    p.insert("token", token.as_str());
+
+    let mut phx = Phoenix::new_with_parameters(&sender, emitter, &callback, &url, &p);
+    let chan = phx.channel(&topic_name).clone();
     {
         let mut chan = chan.lock().unwrap();
         chan.join();
     }
 
+    debug!("Sending producer_join message");
     send_msg(&chan, "producer_join", "{}");
     let output_buffer = String::new();
     let input_buffer = vec![0; 1_000_000];
@@ -68,6 +85,7 @@ pub fn produce() {
             (ProducerState::ReadyToProduce, StreamEvent::Custom("bytes_requested")) => {
                 match io::stdin().read(&mut in_buf) {
                     Ok(0) => {
+                        debug!("No more input, sending done message");
                         send_msg2(&mut chan, "done", "{}");
                         Err(())
                     },
@@ -76,10 +94,12 @@ pub fn produce() {
                         out_buf.push('"');
                         base64::encode_config_buf(&in_buf[0..n], base64::STANDARD, &mut out_buf);
                         out_buf.push('"');
+                        debug!("Sending bytes buffer (len {})", out_buf.len());
                         send_msg2(&mut chan, "bytes", &out_buf);
                         Ok((ProducerState::ReadyToProduce, in_buf, out_buf))
                     },
-                    Err(_) => {
+                    Err(e) => {
+                        warn!("Error reading, sending done. Error: {:?}", e);
                         send_msg2(&mut chan, "done", "{\"error\": true}");
                         Err(())
                     }
@@ -93,17 +113,22 @@ pub fn produce() {
     core.run(runner).map(|_| ()).unwrap_or(());
 
     eprintln!("Done producing");
+
+    Ok(())
 }
 
-pub fn consume() {
+pub fn consume(client: PastaClient, stream_name: &str) -> Result<(), HeyError> {
     let (sender, emitter) = channel(0);
     let (callback, messages) = channel(0);
+    
+    let url = client.get_socket_url()?;
+    let token = client.get_token().expect("no token provided");
 
     let mut p = HashMap::new();
-    p.insert("token", "xxx");
-
-    let mut phx = Phoenix::new_with_parameters(&sender, emitter, &callback, "ws://localhost:4000/socket", &p);
-    let chan = phx.channel("streams:x").clone();
+    p.insert("token", token.as_str());
+    
+    let mut phx = Phoenix::new_with_parameters(&sender, emitter, &callback, &url, &p);
+    let chan = phx.channel(&format!("streams:{}", stream_name)).clone();
     {
         let mut chan = chan.lock().unwrap();
         chan.join();
@@ -137,4 +162,6 @@ pub fn consume() {
     core.run(runner).map(|_| ()).unwrap_or(());
 
     eprintln!("Done consuming");
+
+    Ok(())
 }
